@@ -1,7 +1,8 @@
 // =====================================================
-// V_1_3_0.ino
+// V_1_3_1.ino
 // ESP32 RS485 Modbus -> Web + MQTT Gateway fuer UNICO
-// Version: V1.3.1
+// Version: V1.3.2
+// Build marker: V1.3.2_SETTINGS_PANEL_ACTIVE - search this text in Arduino IDE to verify the correct sketch file.
 // Hardware: ESP32 + RS485-Board, RX=GPIO16, TX=GPIO17, DIR=GPIO18
 // Modbus: 9600 8N1, Slave-ID 1, FC03 Lesen, FC06 Schreiben
 // MQTT: PubSubClient Library erforderlich
@@ -18,7 +19,7 @@
 // =====================================================
 // Version
 // =====================================================
-const char* FW_VERSION = "V1.3.1";
+const char* FW_VERSION = "V1.3.2";
 const char* FW_NAME    = "Unico-Gateway";
 
 // =====================================================
@@ -170,7 +171,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Unico-Gateway V1.3.1</title>
+<title>Unico-Gateway V1.3.2</title>
 <style>
 :root { --footerH: 46px; --tabH: 48px; }
 html { height: 100%; }
@@ -292,6 +293,12 @@ main {
   font-size: 15px;
 }
 .content { padding: 10px; }
+.control-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
 .grid2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -453,6 +460,9 @@ footer {
   .current-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .control-row { grid-template-columns: 1fr 1fr 90px; }
 }
+@media (max-width: 900px) {
+  .control-layout { grid-template-columns: 1fr; }
+}
 @media (max-width: 700px) {
   header { padding: 0; }
   .topbar { align-items: flex-start; flex-direction: column; gap: 2px; padding: 7px 8px 5px 8px; }
@@ -472,7 +482,7 @@ footer {
 <header>
   <div class="topbar">
     <h1>Unico-Gateway</h1>
-    <div class="subtitle">Modbus RTU → MQTT Gateway | V1.3.1</div>
+    <div class="subtitle">Modbus RTU → MQTT Gateway | V1.3.2</div>
   </div>
   <nav class="tabs">
     <button id="btn_bedienen" class="tabbtn" onclick="showTab('bedienen')">Bedienen</button>
@@ -484,64 +494,116 @@ footer {
 
 <main>
   <section id="tab_bedienen" class="tabpage">
-    <div class="section">
-      <h2>Bedienen</h2>
-      <div class="content">
-        <div class="current-overview" id="current_summary">-</div>
+    <div class="control-layout">
+      <div class="section">
+        <h2>Bedienen</h2>
+        <div class="content">
+          <div class="current-overview" id="current_summary">-</div>
 
-        <div id="command_lock" class="lockbox" style="display:none;">
-          <div class="lockrow">
-            <div><label>Klimabefehle-Passwort</label><input id="cmd_pass" type="password" autocomplete="current-password" placeholder="Passwort"></div>
-            <div><label>&nbsp;</label><button onclick="clearCommandPassword()">Leeren</button></div>
+          <div id="command_lock" class="lockbox" style="display:none;">
+            <div class="lockrow">
+              <div><label>Klimabefehle-Passwort</label><input id="cmd_pass" type="password" autocomplete="current-password" placeholder="Passwort"></div>
+              <div><label>&nbsp;</label><button onclick="clearCommandPassword()">Leeren</button></div>
+            </div>
+            <div class="statusnote">Klimabefehle sind geschützt. Alle Senden-Aktionen benötigen dieses Passwort.</div>
           </div>
-          <div class="statusnote">Klimabefehle sind geschützt. Alle Senden-Aktionen benötigen dieses Passwort.</div>
-        </div>
 
-        <div class="control-row">
-          <div><label>Aktion</label><select id="act14" onchange="markActionDirty();"></select></div>
-          <div><label>Betriebsart aktuell</label><div id="current_mode" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendAction14()">Senden</button></div>
-        </div>
-
-        <div class="control-row">
-          <div><label>Solltemperatur</label><input id="wr8" type="number" min="18" max="30" step="1" value="22" onchange="markSetpointDirty()"></div>
-          <div><label>Aktueller Sollwert</label><div id="current_setpoint" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendTemp(8)">Senden</button></div>
-        </div>
-
-        <div class="control-row">
-          <div><label>Lüfterstufe</label><select id="wr_fan" onchange="markFanDirty()"></select></div>
-          <div><label>Aktueller Lüfter</label><div id="current_fan" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendPart14('fan')">Senden</button></div>
-        </div>
-
-        <div class="control-row">
-          <div><label>Silent Mode</label><select id="wr_silent" onchange="markSilentDirty()"></select></div>
-          <div><label>Aktuell</label><div id="current_silent" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendPart14('silent')">Senden</button></div>
-        </div>
-
-        <div class="control-row">
-          <div><label>Flap Swing</label><select id="wr_swing" onchange="markSwingDirty()"></select></div>
-          <div><label>Aktuell</label><div id="current_swing" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendPart14('swing')">Senden</button></div>
-        </div>
-
-        <div class="control-row">
-          <div><label>Economy</label><select id="wr_eco" onchange="markEcoDirty()"></select></div>
-          <div><label>Aktuell</label><div id="current_eco" class="mono">-</div></div>
-          <div><label>&nbsp;</label><button onclick="sendPart14('eco')">Senden</button></div>
-        </div>
-
-        <div class="sep">
           <div class="control-row">
-            <div><label>Raumtemperatur Fernsensor</label><input id="wr5" type="number" min="-10" max="50" step="0.1" value="22.0"></div>
-            <div><label>Hinweis</label><div class="muted">wirkt nur, wenn Fernsensor in den Einstellungen aktiv ist</div></div>
-            <div><label>&nbsp;</label><button onclick="sendTemp(5)">Senden</button></div>
+            <div><label>Aktion</label><select id="act14" onchange="markActionDirty();"></select></div>
+            <div><label>Betriebsart aktuell</label><div id="current_mode" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendAction14()">Senden</button></div>
           </div>
-        </div>
 
-        <div class="help">Die Bedienelemente werden aus den Poll-Daten aktualisiert. Aktualisiert wird nur, wenn sich der Zustand der Klimaanlage geändert hat.</div>
+          <div class="control-row">
+            <div><label>Solltemperatur</label><input id="wr8" type="number" min="18" max="30" step="1" value="22" onchange="markSetpointDirty()"></div>
+            <div><label>Aktueller Sollwert</label><div id="current_setpoint" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendTemp(8)">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Lüfterstufe</label><select id="wr_fan" onchange="markFanDirty()"></select></div>
+            <div><label>Aktueller Lüfter</label><div id="current_fan" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart14('fan')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Silent Mode</label><select id="wr_silent" onchange="markSilentDirty()"></select></div>
+            <div><label>Aktuell</label><div id="current_silent" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart14('silent')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Flap Swing</label><select id="wr_swing" onchange="markSwingDirty()"></select></div>
+            <div><label>Aktuell</label><div id="current_swing" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart14('swing')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Economy</label><select id="wr_eco" onchange="markEcoDirty()"></select></div>
+            <div><label>Aktuell</label><div id="current_eco" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart14('eco')">Senden</button></div>
+          </div>
+
+          <div class="sep">
+            <div class="control-row">
+              <div><label>Raumtemperatur Fernsensor</label><input id="wr5" type="number" min="-10" max="50" step="0.1" value="22.0"></div>
+              <div><label>Hinweis</label><div class="muted">wirkt nur, wenn Fernsensor in den Einstellungen aktiv ist</div></div>
+              <div><label>&nbsp;</label><button onclick="sendTemp(5)">Senden</button></div>
+            </div>
+          </div>
+
+          <div class="help">Die Bedienelemente werden aus den Poll-Daten aktualisiert. Aktualisiert wird nur, wenn sich der Zustand der Klimaanlage geändert hat.</div>
+        </div>
+      </div>
+
+      <!-- UGW_SETTINGS_CONTROL_BLOCK V1.3.2_SETTINGS_PANEL_ACTIVE: schreibbare Register-0012-Einstellungen im Reiter Bedienen -->
+      <div class="section">
+        <h2>Einstellungen</h2>
+        <div class="content">
+          <div class="control-row">
+            <div><label>Displaybeleuchtung</label><select id="wr12_display" onchange="markPart12Dirty('display')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_display" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('display')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Wärmepumpe / nur Kühlen</label><select id="wr12_heatpump" onchange="markPart12Dirty('heatpump')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_heatpump" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('heatpump')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Tastatursperre</label><select id="wr12_keylock" onchange="markPart12Dirty('keylock')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_keylock" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('keylock')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Decken-/Bodeninstallation</label><select id="wr12_install" onchange="markPart12Dirty('install')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_install" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('install')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label title="Energy Boost / System Enable Eingang">Logik Eingangseinstellung</label><select id="wr12_inputlogic" onchange="markPart12Dirty('inputlogic')" title="Energy Boost / System Enable Eingang"></select></div>
+            <div><label>Aktuell</label><div id="current_12_inputlogic" class="mono" title="Energy Boost / System Enable Eingang">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('inputlogic')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Raumtemp. vom Fernsensor</label><select id="wr12_remote" onchange="markPart12Dirty('remote')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_remote" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('remote')">Senden</button></div>
+          </div>
+
+          <div class="control-row">
+            <div><label>Celsius / Fahrenheit</label><select id="wr12_unit" onchange="markPart12Dirty('unit')"></select></div>
+            <div><label>Aktuell</label><div id="current_12_unit" class="mono">-</div></div>
+            <div><label>&nbsp;</label><button onclick="sendPart12('unit')">Senden</button></div>
+          </div>
+
+          <div class="help">Diese Werte schreiben Register 0012 per Read-Modify-Write. Unbeteiligte Bits bleiben erhalten.</div>
+        </div>
       </div>
     </div>
   </section>
@@ -763,7 +825,7 @@ footer {
 <div class="footer-separator"></div>
 <footer>
   <div class="statusline">
-    <span id="st_version" class="mono">V1.3.1</span>
+    <span id="st_version" class="mono">V1.3.2</span>
     <span>Modbus: <span id="st_modbus" class="mono">-</span></span>
     <span>MQTT: <span id="st_mqtt" class="mono">-</span></span>
     <span>WLAN: <span id="st_wifi" class="mono">-</span></span>
@@ -788,6 +850,16 @@ const actions = [
 const modes = ["Standby/Aus", "Kühlen", "Heizen", "Entfeuchten", "Lüften", "Automatik", "6", "7"];
 const fans = ["Niedrig", "Mittel", "Hoch", "Automatik"];
 const onoff = ["aus", "ein"];
+const setting12Options = {
+  display: ["aus", "ein"],
+  heatpump: ["nur Kühlen", "Wärmepumpe"],
+  keylock: ["freigegeben", "gesperrt"],
+  install: ["Boden", "Decke"],
+  inputlogic: ["normal geschlossen", "normal offen"],
+  remote: ["aus", "ein"],
+  unit: ["Celsius", "Fahrenheit"]
+};
+let dirty12 = {};
 let lastControlSig = "";
 let dirtyAction = false;
 let dirtySetpoint = false;
@@ -833,6 +905,7 @@ function markFanDirty(){ dirtyFan = true; }
 function markSilentDirty(){ dirtySilent = true; }
 function markSwingDirty(){ dirtySwing = true; }
 function markEcoDirty(){ dirtyEco = true; }
+function markPart12Dirty(part){ dirty12[part] = true; }
 
 function initControls(){
   const a=$("act14");
@@ -841,6 +914,13 @@ function initControls(){
   setOptions("wr_silent", onoff);
   setOptions("wr_swing", onoff);
   setOptions("wr_eco", onoff);
+  setOptions("wr12_display", setting12Options.display);
+  setOptions("wr12_heatpump", setting12Options.heatpump);
+  setOptions("wr12_keylock", setting12Options.keylock);
+  setOptions("wr12_install", setting12Options.install);
+  setOptions("wr12_inputlogic", setting12Options.inputlogic);
+  setOptions("wr12_remote", setting12Options.remote);
+  setOptions("wr12_unit", setting12Options.unit);
   setCurrentSummaryFrom14(null);
 }
 
@@ -952,6 +1032,19 @@ async function sendPart14(part){
   } catch(e) { alert("Senden fehlgeschlagen"); }
 }
 
+async function sendPart12(part){
+  const id = "wr12_" + part;
+  const value = val(id);
+  try {
+    let url = `/api/write?type=part12&part=${encodeURIComponent(part)}&value=${encodeURIComponent(value)}`;
+    if(climateProtected) url += `&pass=${encodeURIComponent(val("cmd_pass"))}`;
+    const r = await fetch(url);
+    const t = await r.text();
+    if(!r.ok) alert(t);
+    else dirty12[part] = false;
+  } catch(e) { alert("Senden fehlgeschlagen"); }
+}
+
 function clearCommandPassword(){ setVal("cmd_pass", ""); }
 
 function updateBits(d){
@@ -967,14 +1060,30 @@ function updateBits(d){
   }
   const r12 = reg(d,12);
   if(r12 !== null){
-    $("e12_0").textContent = bit(r12,0) ? "ein" : "aus";
-    $("e12_1").textContent = bit(r12,1) ? "Wärmepumpe" : "nur Kühlen";
-    $("e12_2").textContent = bit(r12,2) ? "gesperrt" : "freigegeben";
-    $("e12_3").textContent = bit(r12,3) ? "Decke" : "Boden";
-    $("e12_4").textContent = bit(r12,4) ? "normal offen" : "normal geschlossen";
-    $("e12_4").title = bit(r12,4) ? "Energy Boost / System Enable: Kontakt schließt" : "Energy Boost / System Enable: Kontakt öffnet";
-    $("e12_5").textContent = bit(r12,5) ? "ein" : "aus";
-    $("e12_6").textContent = bit(r12,6) ? "Fahrenheit" : "Celsius";
+    const s12 = {
+      display: bit(r12,0),
+      heatpump: bit(r12,1),
+      keylock: bit(r12,2),
+      install: bit(r12,3),
+      inputlogic: bit(r12,4),
+      remote: bit(r12,5),
+      unit: bit(r12,6)
+    };
+    $("e12_0").textContent = setting12Options.display[s12.display];
+    $("e12_1").textContent = setting12Options.heatpump[s12.heatpump];
+    $("e12_2").textContent = setting12Options.keylock[s12.keylock];
+    $("e12_3").textContent = setting12Options.install[s12.install];
+    $("e12_4").textContent = setting12Options.inputlogic[s12.inputlogic];
+    $("e12_4").title = s12.inputlogic ? "Energy Boost / System Enable: Kontakt schließt" : "Energy Boost / System Enable: Kontakt öffnet";
+    $("e12_5").textContent = setting12Options.remote[s12.remote];
+    $("e12_6").textContent = setting12Options.unit[s12.unit];
+
+    Object.keys(s12).forEach(part => {
+      setText("current_12_" + part, setting12Options[part][s12[part]]);
+      if(!dirty12[part]) setVal("wr12_" + part, s12[part]);
+    });
+    const il = $("current_12_inputlogic");
+    if(il) il.title = s12.inputlogic ? "Energy Boost / System Enable: Kontakt schließt" : "Energy Boost / System Enable: Kontakt öffnet";
   }
 }
 
@@ -2115,7 +2224,7 @@ void handleState() {
   server.send(200, "application/json; charset=utf-8", s);
 }
 
-// HTTP-API fuer alle schreibenden Klimabefehle aus dem Reiter Bedienen.
+// HTTP-API fuer alle schreibenden Klimabefehle und Einstellungen aus dem Reiter Bedienen.
 // Wenn die Web-Bedienung deaktiviert ist, wird jedes Schreiben verworfen.
 // Wenn Klimabefehle geschuetzt sind, wird vor jedem Schreiben das Passwort
 // aus dem Parameter pass=... geprueft.
@@ -2217,6 +2326,49 @@ void handleWrite() {
         } else {
           uint16_t target = (live[0] & ~mask) | (bits & mask);
           ok = writeHoldingVerified(14, target, mask, label);
+          msg = ok ? "OK" : "NOK";
+        }
+      }
+    }
+  }
+  else if (type == "part12") {
+    if (!server.hasArg("part") || !server.hasArg("value")) {
+      msg = "part oder value fehlt";
+    } else {
+      String part = server.arg("part");
+      int value = server.arg("value").toInt();
+      uint16_t mask = 0;
+      uint16_t bits = 0;
+      String label = "PART12";
+
+      if (value < 0 || value > 1) {
+        msg = "Einstellwert ungueltig";
+      } else if (part == "display") {
+        mask = 0x0001; bits = (uint16_t)value; label = "DISP12";
+      } else if (part == "heatpump") {
+        mask = 0x0002; bits = ((uint16_t)value) << 1; label = "HP12";
+      } else if (part == "keylock") {
+        mask = 0x0004; bits = ((uint16_t)value) << 2; label = "KEY12";
+      } else if (part == "install") {
+        mask = 0x0008; bits = ((uint16_t)value) << 3; label = "INST12";
+      } else if (part == "inputlogic") {
+        mask = 0x0010; bits = ((uint16_t)value) << 4; label = "INP12";
+      } else if (part == "remote") {
+        mask = 0x0020; bits = ((uint16_t)value) << 5; label = "REM12";
+      } else if (part == "unit") {
+        mask = 0x0040; bits = ((uint16_t)value) << 6; label = "UNIT12";
+      } else {
+        msg = "part ungueltig";
+      }
+
+      if (mask != 0) {
+        uint16_t live[1];
+        delay(WRITE_PAUSE_BEFORE);
+        if (!readHolding(cfgModbusSlaveId, 12, 1, live)) {
+          msg = "Register 0012 konnte nicht gelesen werden";
+        } else {
+          uint16_t target = (live[0] & ~mask) | (bits & mask);
+          ok = writeHoldingVerified(12, target, mask, label);
           msg = ok ? "OK" : "NOK";
         }
       }
@@ -2530,7 +2682,7 @@ void setup() {
   server.begin();
 
   lastStatus = "Bereit";
-  Serial.println("Unico-Gateway V1.3.1 bereit");
+  Serial.println("Unico-Gateway V1.3.2 bereit - SETTINGS_PANEL_ACTIVE / Bedienen plus Einstellungen");
 }
 
 // Hauptschleife: Webserver bedienen, MQTT-Verbindung pflegen und Modbus zyklisch pollen.
