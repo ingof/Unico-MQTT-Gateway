@@ -18,6 +18,8 @@ The gateway polls selected Modbus registers from the air conditioner, displays t
 
 The web interface is designed as a user-friendly gateway interface, not as a raw Modbus diagnostic tool. Normal pages do not show raw Modbus telegrams, register addresses, or CRC details.
 
+![Unico Gateway Webinterface](ugw.png)
+
 ---
 
 ## Main Features
