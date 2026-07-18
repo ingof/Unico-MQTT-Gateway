@@ -35,7 +35,9 @@ The web interface is designed as a user-friendly gateway interface, not as a raw
 - MQTT command support can be enabled or disabled
 - Settings stored in ESP32 Preferences / NVS
 - Default values provided through `UGW_secrets.h`
+- WLAN reconnect
 - Local fallback Access Point
+- NTP synchronization
 - Designed for local network use
 
 ---
@@ -73,6 +75,6 @@ Typical wiring:
 The Arduino sketch folder should look like this:
 
 ```text
-V_1_3_1/
-  V_1_3_1.ino
+Unico-MQTT-Gateway/
+  Unico-MQTT.Gatewayino
   UGW_secrets.h
