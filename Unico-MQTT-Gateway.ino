@@ -1,8 +1,8 @@
 // =====================================================
-// V_1_3_1.ino
+// V_1_4_5.ino
 // ESP32 RS485 Modbus -> Web + MQTT Gateway fuer UNICO
-// Version: V1.3.2
-// Build marker: V1.3.2_SETTINGS_PANEL_ACTIVE - search this text in Arduino IDE to verify the correct sketch file.
+// Version: V1.4.5
+// Build marker: V1.4.5_NTP_WIFI_REASON_DIAGNOSTICS_ACTIVE - search this text in Arduino IDE to verify the correct sketch file.
 // Hardware: ESP32 + RS485-Board, RX=GPIO16, TX=GPIO17, DIR=GPIO18
 // Modbus: 9600 8N1, Slave-ID 1, FC03 Lesen, FC06 Schreiben
 // MQTT: PubSubClient Library erforderlich
@@ -14,12 +14,14 @@
 #include <Preferences.h>
 #include <esp_system.h>
 #include <math.h>
+#include <time.h>
+#include <ctype.h>
 #include "UGW_secrets.h"
 
 // =====================================================
 // Version
 // =====================================================
-const char* FW_VERSION = "V1.3.2";
+const char* FW_VERSION = "V1.4.5";
 const char* FW_NAME    = "Unico-Gateway";
 
 // =====================================================
@@ -38,6 +40,11 @@ String cfgMqttUser;
 String cfgMqttPass;
 String cfgMqttClientId;
 String cfgMqttRoot;
+
+// NTP-Server: Hostname oder IPv4-Adresse, ohne Protokollpraefix.
+// UGW_secrets.h liefert den Default; die Webkonfiguration kann ihn in NVS ueberschreiben.
+String cfgNtpServer;
+const char* UGW_TIMEZONE = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // MQTT-Sendeintervall fuer zyklische State-/Sensor-Topics.
 // Die Mess-/Statusdaten werden nicht bei jedem Modbus-Poll an MQTT geschickt,
@@ -77,7 +84,16 @@ String modbusParityText();
 void applyModbusSerial();
 void publishControlChangesIfNeeded(bool force);
 String publicStatusText();
-
+void maintainWiFi();
+void startFallbackAp(const String& reason);
+String wifiStatusText(int statusCode);
+String currentWifiModeForUi();
+String wifiDisconnectReasonText(uint8_t reason);
+String currentDateTimeText();
+void startNtpSync(const String& trigger);
+void maintainNtp();
+void processPendingWifiEvents();
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
 
 
 // =====================================================
@@ -136,6 +152,45 @@ bool writeBusy = false;
 String lastStatus = "Start";
 String wifiModeText = "";
 
+// WLAN-Diagnose und Reconnect-Status.
+// Die Modbus-/RS485-Seite kann weiterlaufen, auch wenn WLAN kurzzeitig weg ist.
+// Diese Variablen beschreiben deshalb getrennt, warum WLAN nicht erreichbar war
+// und welche Gegenmassnahme der ESP gestartet hat.
+String lastWifiError = "Noch nicht geprueft";
+String lastWifiAction = "Start";
+uint32_t wifiReconnectAttempts = 0;
+uint32_t lastWifiCheckMs = 0;
+uint32_t wifiLostSinceMs = 0;
+bool wifiFallbackApActive = false;
+int lastWifiStatusCode = WL_IDLE_STATUS;
+int lastWifiRssi = 0;
+
+// Genaue WLAN-Abbruchdiagnose aus dem ESP32-WiFi-Event.
+// Der Event-Callback laeuft in einem eigenen FreeRTOS-Task. Deshalb legt er nur
+// primitive Daten thread-sicher ab; String-Aufbereitung und Webanzeige erfolgen in loop().
+portMUX_TYPE wifiEventMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool pendingWifiDisconnect = false;
+volatile bool pendingWifiLostIp = false;
+volatile uint8_t pendingWifiDisconnectReason = 0;
+uint8_t lastWifiDisconnectReasonCode = 0;
+String lastWifiDisconnectReason = "Noch kein Abbruch erkannt";
+String lastWifiDisconnectAt = "-";
+int lastWifiDisconnectRssi = 0;
+
+// NTP-Status. Die Zeit und WLAN-Ereignisse werden nur im RAM gehalten.
+// Es erfolgen bewusst keine NVS-Schreibzugriffe fuer die Fehlerhistorie.
+bool ntpConfigured = false;
+bool ntpSynchronized = false;
+uint32_t ntpConfiguredMs = 0;
+uint32_t lastNtpCheckMs = 0;
+String lastNtpStatus = "Noch nicht gestartet";
+
+// RAM-Ringpuffer fuer die letzten WLAN-Ereignisse seit dem Boot.
+const uint8_t WIFI_EVENT_LOG_SIZE = 12;
+String wifiEventLog[WIFI_EVENT_LOG_SIZE];
+uint8_t wifiEventLogCount = 0;
+uint8_t wifiEventLogNext = 0;
+
 // =====================================================
 // Hilfsdaten 0014 Aktionen
 // Maskierung konservativ:
@@ -171,7 +226,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Unico-Gateway V1.3.2</title>
+<title>Unico-Gateway V1.4.5</title>
 <style>
 :root { --footerH: 46px; --tabH: 48px; }
 html { height: 100%; }
@@ -335,6 +390,7 @@ th, td {
 }
 th { color: #ccc; background: #202020; }
 td.value { font-family: Consolas, monospace; text-align: right; }
+td.value[title] { cursor: help; }
 tr.gap td { padding-top: 13px; border-top: 1px solid #444; }
 input, select, button {
   width: 100%;
@@ -453,6 +509,21 @@ footer {
   align-items: end;
 }
 .statusnote { color: #ffd37a; font-size: 12px; margin-top: 8px; }
+.eventlog {
+  margin-top: 10px;
+  padding: 8px;
+  min-height: 54px;
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #d7d7d7;
+  background: #141414;
+  border: 1px solid #303030;
+  border-radius: 4px;
+}
 
 @media (max-width: 1100px) {
   .grid2, .grid3 { grid-template-columns: 1fr; }
@@ -482,7 +553,7 @@ footer {
 <header>
   <div class="topbar">
     <h1>Unico-Gateway</h1>
-    <div class="subtitle">Modbus RTU → MQTT Gateway | V1.3.2</div>
+    <div class="subtitle">Modbus RTU → MQTT Gateway | V1.4.5</div>
   </div>
   <nav class="tabs">
     <button id="btn_bedienen" class="tabbtn" onclick="showTab('bedienen')">Bedienen</button>
@@ -556,7 +627,7 @@ footer {
         </div>
       </div>
 
-      <!-- UGW_SETTINGS_CONTROL_BLOCK V1.3.2_SETTINGS_PANEL_ACTIVE: schreibbare Register-0012-Einstellungen im Reiter Bedienen -->
+      <!-- UGW_SETTINGS_CONTROL_BLOCK V1.4.5_NTP_WIFI_REASON_DIAGNOSTICS_ACTIVE: schreibbare Register-0012-Einstellungen im Reiter Bedienen -->
       <div class="section">
         <h2>Einstellungen</h2>
         <div class="content">
@@ -769,14 +840,27 @@ footer {
               <tr><td>Betrieb</td><td id="cfg_wifi_mode" class="value">-</td></tr>
               <tr><td>IP-Adresse</td><td id="cfg_ip" class="value">-</td></tr>
               <tr><td>Signal</td><td id="cfg_rssi" class="value">-</td></tr>
+              <tr><td>Datum / Uhrzeit</td><td id="cfg_datetime" class="value">-</td></tr>
+              <tr><td>NTP-Status</td><td id="cfg_ntp_status" class="value">-</td></tr>
+              <tr><td>NTP-Server</td><td id="cfg_ntp_server_current" class="value">-</td></tr>
+              <tr><td>WLAN-Status</td><td id="cfg_wifi_status" class="value">-</td></tr>
+              <tr><td>Letzter Abbruch</td><td id="cfg_wifi_disconnect_at" class="value">-</td></tr>
+              <tr><td>Abbruchgrund</td><td id="cfg_wifi_disconnect_reason" class="value">-</td></tr>
+              <tr><td>Reason-Code</td><td id="cfg_wifi_reason_code" class="value">-</td></tr>
+              <tr><td>Signal vor Abbruch</td><td id="cfg_wifi_disconnect_rssi" class="value">-</td></tr>
+              <tr><td>WLAN-Aktion</td><td id="cfg_wifi_action" class="value">-</td></tr>
+              <tr><td>Reconnect-Versuche</td><td id="cfg_wifi_try" class="value">-</td></tr>
             </tbody></table>
             <div class="formgrid sep">
               <label for="cfg_wifi_ssid">WLAN SSID</label><input id="cfg_wifi_ssid" type="text" autocomplete="username">
               <label for="cfg_wifi_pass">WLAN Passwort</label><input id="cfg_wifi_pass" type="password" autocomplete="new-password" placeholder="leer = unverändert">
               <label for="cfg_ap_ssid">AP Name</label><input id="cfg_ap_ssid" type="text">
               <label for="cfg_ap_pass">AP Passwort</label><input id="cfg_ap_pass" type="password" autocomplete="new-password" placeholder="leer = unverändert, min. 8 Zeichen">
+              <label for="cfg_ntp_server">NTP-Server</label><input id="cfg_ntp_server" type="text" placeholder="Hostname oder IPv4-Adresse">
             </div>
-            <div class="help">WLAN- und AP-Änderungen werden gespeichert und nach Neustart aktiv. Leeres Passwortfeld bedeutet: vorhandenes Passwort behalten.</div>
+            <div class="help">NTP-Server ohne http:// oder https:// eintragen, z. B. time.cloudflare.com oder 192.168.1.1. WLAN- und AP-Änderungen werden nach Neustart aktiv; NTP wird sofort neu gestartet.</div>
+            <div class="help"><strong>WLAN-Ereignisse seit Start</strong></div>
+            <div id="cfg_wifi_events" class="eventlog">-</div>
           </div>
         </div>
 
@@ -825,7 +909,7 @@ footer {
 <div class="footer-separator"></div>
 <footer>
   <div class="statusline">
-    <span id="st_version" class="mono">V1.3.2</span>
+    <span id="st_version" class="mono">V1.4.5</span>
     <span>Modbus: <span id="st_modbus" class="mono">-</span></span>
     <span>MQTT: <span id="st_mqtt" class="mono">-</span></span>
     <span>WLAN: <span id="st_wifi" class="mono">-</span></span>
@@ -859,6 +943,47 @@ const setting12Options = {
   remote: ["aus", "ein"],
   unit: ["Celsius", "Fahrenheit"]
 };
+
+// Fehlercode-Texte aus der UNICO-Alarmtabelle.
+// In der normalen Tabelle bleibt der Zahlenwert stehen; der Klartext erscheint als Hover-Hilfe.
+const alarmCodeText = {
+  1: "Defekt des Außentemperaturfühlers",
+  2: "Defekt des Außentemperaturfühlers der Batterie",
+  3: "Defekt des Vorlauftemperaturfühlers",
+  4: "Überhitzungsschutz Leistungsplatine",
+  5: "Kommunikationsproblem Platine interne und externe Logik",
+  6: "Der Kompressor hat einen ungewöhnlichen Start: Phasenverlust oder umgekehrte Drehung",
+  7: "Drehgeschwindigkeitsverlust des Kompressors",
+  8: "Defekt der Leistungsplatine",
+  9: "Stromstörung",
+  10: "Zu hohe Außentemperatur der Batterie im Heizmodus",
+  11: "Ungewöhnlicher Nulldurchgang des Motors des inneren Lüfters",
+  12: "EEPROM-Störung externe Logik",
+  13: "Überhitzungsschutz Vorlauftemperatur",
+  14: "Defekt des Raumtemperaturfühlers",
+  15: "Defekt des Sensors der inneren Batterie",
+  16: "Unterkühlungsschutz der inneren Batterie im Kühlmodus",
+  17: "Überhitzungsschutz der inneren Batterie im Heizmodus",
+  18: "Fehler Feedback-Geschwindigkeit Motor externer Lüfter",
+  19: "Fehler Feedback-Geschwindigkeit Motor interner Lüfter",
+  20: "Wasserstandsalarm",
+  21: "EEPROM-Störung interne Logik",
+  22: "Kompressorstrom nicht geeignet",
+  24: "Außentemperatur zu hoch für den Heizmodus",
+  25: "Innentemperatur zu niedrig für den Kühlmodus",
+  26: "Kommunikationsfehler zwischen Platine der internen Logik und Treiber",
+  27: "Überspannung Bus Treiberplatine",
+  28: "Unterspannung Bus Treiberplatine",
+  30: "Stromschutz am Kompressor",
+  31: "Zu hoher oder zu niedriger Wechselstromschutz externe Platine",
+  32: "Wechselstromschutz externe Platine",
+  33: "Zu hoher oder zu niedriger Gleichstromschutz Bus",
+  34: "Kommunikationsfehler Treiberplatine und Display"
+};
+function alarmCodeTitle(code){
+  if(code === 0) return "Kein Fehlercode";
+  return alarmCodeText[code] ? ("Fehlercode " + code + ": " + alarmCodeText[code]) : ("Fehlercode " + code + ": nicht in der bekannten Alarmtabelle");
+}
 let dirty12 = {};
 let lastControlSig = "";
 let dirtyAction = false;
@@ -1109,7 +1234,10 @@ function updateValues(d){
       else if(a===307 || a===309) txt = signed16(v) + " V";
       else txt = String(signed16(v));
     }
-    $("m"+a).textContent = txt;
+    const el = $("m"+a);
+    el.textContent = txt;
+    if(a === 304) el.title = (v === null) ? "" : alarmCodeTitle(signed16(v));
+    if(a === 305) el.title = (v === null) ? "" : "Schutzcode " + signed16(v) + ": noch keine Schutzcode-Tabelle hinterlegt";
   }
 }
 
@@ -1128,7 +1256,18 @@ function updateMeta(d){
   $("mb_timeout").textContent = d.modbusTimeout + " ms";
   $("cfg_wifi_mode").textContent = d.wifiMode;
   $("cfg_ip").textContent = d.ip;
-  $("cfg_rssi").textContent = d.rssi + " dBm";
+  $("cfg_rssi").textContent = d.wifiConnected ? (d.rssi + " dBm") : "-";
+  setText("cfg_datetime", d.dateTime);
+  setText("cfg_ntp_status", d.ntpStatus);
+  setText("cfg_ntp_server_current", d.ntpServer);
+  setText("cfg_wifi_status", d.wifiError);
+  setText("cfg_wifi_disconnect_at", d.wifiDisconnectAt);
+  setText("cfg_wifi_disconnect_reason", d.wifiDisconnectReason);
+  setText("cfg_wifi_reason_code", d.wifiDisconnectReasonCode);
+  setText("cfg_wifi_disconnect_rssi", d.wifiDisconnectRssi ? (d.wifiDisconnectRssi + " dBm") : "-");
+  setText("cfg_wifi_action", d.wifiAction);
+  setText("cfg_wifi_try", d.wifiReconnectAttempts);
+  setText("cfg_wifi_events", d.wifiEventLog);
 
   $("st_modbus").textContent = d.status;
   $("st_mqtt").textContent = d.mqttConnected ? "OK" : d.mqttError;
@@ -1157,6 +1296,7 @@ async function loadConfig(){
     climateProtected = !!c.climateProtected;
     setVal("cfg_wifi_ssid", c.wifiSsid);
     setVal("cfg_ap_ssid", c.apSsid);
+    setVal("cfg_ntp_server", c.ntpServer);
     setVal("cfg_mqtt_host", c.mqttHost);
     setVal("cfg_mqtt_port", c.mqttPort);
     setVal("cfg_mqtt_user", c.mqttUser);
@@ -1197,6 +1337,7 @@ async function saveConfig(){
       wifi_pass: val("cfg_wifi_pass"),
       ap_ssid: val("cfg_ap_ssid"),
       ap_pass: val("cfg_ap_pass"),
+      ntp_server: val("cfg_ntp_server"),
       mqtt_host: val("cfg_mqtt_host"),
       mqtt_port: val("cfg_mqtt_port"),
       mqtt_user: val("cfg_mqtt_user"),
@@ -1338,8 +1479,199 @@ String oneDecimalFromRaw10(uint16_t raw) {
 }
 
 
+
+// Liefert die lokale Uhrzeit. Vor erfolgreicher NTP-Synchronisation wird eine
+// eindeutige Uptime-Angabe verwendet, damit auch fruehe WLAN-Ereignisse nachvollziehbar bleiben.
+String currentDateTimeText() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) {
+    uint32_t sec = millis() / 1000UL;
+    char buf[56];
+    snprintf(buf, sizeof(buf), "Zeit nicht synchronisiert (Uptime %lu:%02lu:%02lu)",
+             (unsigned long)(sec / 3600UL),
+             (unsigned long)((sec / 60UL) % 60UL),
+             (unsigned long)(sec % 60UL));
+    return String(buf);
+  }
+  struct tm localTm;
+  localtime_r(&now, &localTm);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M:%S", &localTm);
+  return String(buf);
+}
+
+// Uebersetzt die vom ESP32-WiFi-Treiber gemeldeten Disconnect-Reason-Codes.
+// Unbekannte oder kuenftig neue Codes bleiben mit ihrer Nummer sichtbar.
+String wifiDisconnectReasonText(uint8_t reason) {
+  switch (reason) {
+    case 1:   return "Nicht naeher spezifizierter Verbindungsabbruch";
+    case 2:   return "Authentifizierung abgelaufen (AUTH_EXPIRE)";
+    case 3:   return "Access Point hat Authentifizierung beendet (AUTH_LEAVE)";
+    case 4:   return "Zuordnung zum Access Point abgelaufen (ASSOC_EXPIRE)";
+    case 5:   return "Access Point hat zu viele Stationen (ASSOC_TOOMANY)";
+    case 6:   return "Station war nicht authentifiziert (NOT_AUTHED)";
+    case 7:   return "Station war nicht zugeordnet (NOT_ASSOCED)";
+    case 8:   return "Zuordnung wurde beendet (ASSOC_LEAVE)";
+    case 9:   return "Zuordnung ohne gueltige Authentifizierung";
+    case 15:  return "WPA Vierwege-Handshake Timeout";
+    case 16:  return "Gruppenschluessel-Aktualisierung Timeout";
+    case 17:  return "WPA-Informationselement im Handshake abweichend";
+    case 18:  return "Ungueltige Gruppenverschluesselung";
+    case 19:  return "Ungueltige Paarverschluesselung";
+    case 20:  return "Ungueltiges Authentifizierungsverfahren";
+    case 21:  return "Nicht unterstuetzte RSN-Version";
+    case 22:  return "Ungueltige RSN-Faehigkeiten";
+    case 23:  return "802.1X-Authentifizierung fehlgeschlagen";
+    case 24:  return "Verschluesselungsverfahren abgelehnt";
+    case 200: return "Beacon-Timeout: Access Point nicht mehr empfangen";
+    case 201: return "Konfigurierter Access Point nicht gefunden";
+    case 202: return "Authentifizierung fehlgeschlagen; Passwort/Sicherheitsmodus pruefen";
+    case 203: return "Zuordnung zum Access Point fehlgeschlagen";
+    case 204: return "WPA-Handshake fehlgeschlagen oder abgelaufen";
+    case 205: return "Allgemeiner Verbindungsaufbau fehlgeschlagen";
+    case 206: return "Zeitbasis des Access Points wurde zurueckgesetzt";
+    case 207: return "Roaming / Wechsel des Access Points";
+    case 208: return "Access Point verlangt zu lange Wartezeit fuer erneute Zuordnung";
+    case 209: return "Access Point wegen RSSI-Grenzwert nicht gefunden";
+    case 210: return "Access Point passt nicht zu den Authentifizierungsanforderungen";
+    case 211: return "Kein Access Point mit kompatibler Sicherheit gefunden";
+    default:  return String("Unbekannter WiFi-Reason-Code ") + String(reason);
+  }
+}
+
+// Fuegt ein Ereignis in den RAM-Ringpuffer ein. Es erfolgen keine NVS-Schreibzugriffe.
+void addWifiEventLog(const String& text) {
+  wifiEventLog[wifiEventLogNext] = currentDateTimeText() + " | " + text;
+  wifiEventLogNext = (wifiEventLogNext + 1) % WIFI_EVENT_LOG_SIZE;
+  if (wifiEventLogCount < WIFI_EVENT_LOG_SIZE) wifiEventLogCount++;
+}
+
+String wifiEventLogText() {
+  if (wifiEventLogCount == 0) return "Noch keine WLAN-Ereignisse seit dem Start";
+  String out;
+  out.reserve(1600);
+  uint8_t first = (wifiEventLogNext + WIFI_EVENT_LOG_SIZE - wifiEventLogCount) % WIFI_EVENT_LOG_SIZE;
+  for (uint8_t i = 0; i < wifiEventLogCount; i++) {
+    uint8_t pos = (first + i) % WIFI_EVENT_LOG_SIZE;
+    if (i) out += "\n";
+    out += wifiEventLog[pos];
+  }
+  return out;
+}
+
+// Akzeptiert DNS-Hostnamen und IPv4-Adressen. Protokollangaben wie http:// sind
+// nicht erlaubt, da der SNTP-Client nur Hostname bzw. Adresse erwartet.
+bool validNtpServerText(const String& value) {
+  if (value.length() < 1 || value.length() > 253) return false;
+  for (size_t i = 0; i < value.length(); i++) {
+    char c = value[i];
+    if (!(isalnum((unsigned char)c) || c == '.' || c == '-')) return false;
+  }
+  return value.indexOf("..") < 0;
+}
+
+// Startet bzw. erneuert die SNTP-Abfrage. cfgNtpServer darf ein DNS-Hostname
+// oder eine numerische IPv4-Adresse sein. Die POSIX-Regel stellt MEZ/MESZ automatisch um.
+void startNtpSync(const String& trigger) {
+  if (WiFi.status() != WL_CONNECTED || cfgNtpServer.length() == 0) return;
+  configTzTime(UGW_TIMEZONE, cfgNtpServer.c_str());
+  ntpConfigured = true;
+  ntpSynchronized = false;
+  ntpConfiguredMs = millis();
+  lastNtpStatus = "Synchronisierung gestartet: " + trigger;
+  addWifiEventLog("NTP gestartet ueber " + cfgNtpServer + " (" + trigger + ")");
+}
+
+// Prueft asynchron, ob der SNTP-Client bereits eine plausible Zeit geliefert hat.
+// Modbus-Polling und Webserver werden nicht blockiert.
+void maintainNtp() {
+  if (!ntpConfigured || millis() - lastNtpCheckMs < 2000UL) return;
+  lastNtpCheckMs = millis();
+  time_t now = time(nullptr);
+  if (now >= 1700000000) {
+    if (!ntpSynchronized) {
+      ntpSynchronized = true;
+      lastNtpStatus = "Synchronisiert";
+      addWifiEventLog("NTP-Zeit synchronisiert");
+      Serial.println("NTP OK: " + currentDateTimeText());
+    }
+  } else if (millis() - ntpConfiguredMs > 30000UL) {
+    lastNtpStatus = "Noch nicht synchronisiert; Server/Internet/DNS pruefen";
+  } else {
+    lastNtpStatus = "Synchronisierung laeuft";
+  }
+}
+
+// WiFi.onEvent wird in einem separaten Task aufgerufen. Deshalb werden hier
+// ausschliesslich primitive Flags/Codes in einer Critical Section gesetzt.
+void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    portENTER_CRITICAL(&wifiEventMux);
+    pendingWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+    pendingWifiDisconnect = true;
+    portEXIT_CRITICAL(&wifiEventMux);
+  } else if (event == ARDUINO_EVENT_WIFI_STA_LOST_IP) {
+    portENTER_CRITICAL(&wifiEventMux);
+    pendingWifiLostIp = true;
+    portEXIT_CRITICAL(&wifiEventMux);
+  }
+}
+
+// Uebernimmt die vom Event-Task gemeldeten Daten im normalen loop()-Kontext.
+void processPendingWifiEvents() {
+  bool gotDisconnect = false;
+  bool gotLostIp = false;
+  uint8_t reason = 0;
+  portENTER_CRITICAL(&wifiEventMux);
+  if (pendingWifiDisconnect) {
+    gotDisconnect = true;
+    reason = pendingWifiDisconnectReason;
+    pendingWifiDisconnect = false;
+  }
+  if (pendingWifiLostIp) {
+    gotLostIp = true;
+    pendingWifiLostIp = false;
+  }
+  portEXIT_CRITICAL(&wifiEventMux);
+
+  if (gotDisconnect) {
+    lastWifiDisconnectReasonCode = reason;
+    lastWifiDisconnectReason = wifiDisconnectReasonText(reason);
+    lastWifiDisconnectAt = currentDateTimeText();
+    lastWifiDisconnectRssi = lastWifiRssi;
+    lastWifiError = "WLAN getrennt: " + lastWifiDisconnectReason;
+    addWifiEventLog("WLAN-Abbruch, Code " + String(reason) + ": " + lastWifiDisconnectReason +
+                    ", letztes RSSI " + String(lastWifiDisconnectRssi) + " dBm");
+    Serial.println(lastWifiError + " | " + lastWifiDisconnectAt);
+  }
+  if (gotLostIp) {
+    addWifiEventLog("IP-Adresse verloren; DHCP/Router-Verbindung pruefen");
+    lastWifiError = "WLAN-IP verloren";
+  }
+}
+
+String wifiStatusText(int statusCode) {
+  switch (statusCode) {
+    case WL_CONNECTED: return "verbunden";
+    case WL_NO_SSID_AVAIL: return "SSID nicht gefunden";
+    case WL_CONNECT_FAILED: return "Verbindung fehlgeschlagen, Passwort/Handshake moeglich";
+    case WL_CONNECTION_LOST: return "Verbindung verloren";
+    case WL_DISCONNECTED: return "getrennt";
+    case WL_IDLE_STATUS: return "wartet";
+    default: return String("WLAN Status ") + String(statusCode);
+  }
+}
+
+String currentWifiModeForUi() {
+  if (WiFi.status() == WL_CONNECTED) return "STA";
+  if (wifiFallbackApActive || wifiModeText == "AP" || wifiModeText == "AP Fehler") return "AP";
+  return wifiModeText.length() ? wifiModeText : "STA";
+}
+
 String currentIpText() {
-  return (wifiModeText == "AP") ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  if (WiFi.status() == WL_CONNECTED) return WiFi.localIP().toString();
+  if (wifiFallbackApActive || wifiModeText == "AP" || wifiModeText == "AP Fehler") return WiFi.softAPIP().toString();
+  return WiFi.localIP().toString();
 }
 
 String mqttStateText(int st) {
@@ -1399,6 +1731,7 @@ uint32_t serialConfigFromSettings() {
 void normalizeRuntimeConfig() {
   if (cfgMqttPublishIntervalSec < 5) cfgMqttPublishIntervalSec = 5;
   if (cfgMqttPublishIntervalSec > 900) cfgMqttPublishIntervalSec = 900;
+  if (!validNtpServerText(cfgNtpServer)) cfgNtpServer = UGW_NTP_SERVER;
 
   if (cfgModbusSlaveId < 1 || cfgModbusSlaveId > 247) cfgModbusSlaveId = 1;
   if (cfgModbusBaudrate < 1200 || cfgModbusBaudrate > 115200) cfgModbusBaudrate = 9600;
@@ -1464,6 +1797,7 @@ void loadConfig() {
   cfgMqttPass = prefs.getString("mqtt_pass", UGW_MQTT_PASSWORD);
   cfgMqttClientId = prefs.getString("mqtt_cid", UGW_MQTT_CLIENTID);
   cfgMqttRoot = prefs.getString("mqtt_root", UGW_MQTT_ROOT);
+  cfgNtpServer = prefs.getString("ntp_server", UGW_NTP_SERVER);
   cfgConfigPassword = prefs.getString("cfg_pass", "");
   cfgClimateProtected = prefs.getBool("clim_prot", false);
   cfgWebCommandsEnabled = prefs.getBool("web_cmd", true);
@@ -1483,6 +1817,7 @@ void loadConfig() {
   if (cfgMqttHost.length() == 0) cfgMqttHost = UGW_MQTT_HOST;
   if (cfgMqttClientId.length() == 0) cfgMqttClientId = UGW_MQTT_CLIENTID;
   if (cfgMqttRoot.length() == 0) cfgMqttRoot = UGW_MQTT_ROOT;
+  if (!validNtpServerText(cfgNtpServer)) cfgNtpServer = UGW_NTP_SERVER;
   if (!hasConfigPassword()) cfgClimateProtected = false;
   normalizeRuntimeConfig();
 }
@@ -2176,13 +2511,26 @@ void handleRoot() {
 // fuer das Webinterface, fuer openHAB bleibt MQTT die bevorzugte Schnittstelle.
 void handleState() {
   String s;
-  s.reserve(4096);
+  s.reserve(6400);
   s += "{";
   s += "\"version\":\""; s += FW_VERSION; s += "\",";
   s += "\"status\":\""; s += jsonEscape(publicStatusText()); s += "\",";
   s += "\"ip\":\""; s += currentIpText(); s += "\",";
-  s += "\"wifiMode\":\""; s += jsonEscape(wifiModeText); s += "\",";
+  s += "\"wifiMode\":\""; s += jsonEscape(currentWifiModeForUi()); s += "\",";
+  s += "\"wifiConnected\":"; s += (WiFi.status() == WL_CONNECTED ? "true" : "false"); s += ",";
+  s += "\"wifiStatusCode\":"; s += String(WiFi.status()); s += ",";
+  s += "\"wifiError\":\""; s += jsonEscape(lastWifiError); s += "\",";
+  s += "\"wifiAction\":\""; s += jsonEscape(lastWifiAction); s += "\",";
+  s += "\"wifiReconnectAttempts\":"; s += String(wifiReconnectAttempts); s += ",";
   s += "\"rssi\":"; s += String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0); s += ",";
+  s += "\"dateTime\":\""; s += jsonEscape(currentDateTimeText()); s += "\",";
+  s += "\"ntpServer\":\""; s += jsonEscape(cfgNtpServer); s += "\",";
+  s += "\"ntpStatus\":\""; s += jsonEscape(lastNtpStatus); s += "\",";
+  s += "\"wifiDisconnectAt\":\""; s += jsonEscape(lastWifiDisconnectAt); s += "\",";
+  s += "\"wifiDisconnectReasonCode\":"; s += String(lastWifiDisconnectReasonCode); s += ",";
+  s += "\"wifiDisconnectReason\":\""; s += jsonEscape(lastWifiDisconnectReason); s += "\",";
+  s += "\"wifiDisconnectRssi\":"; s += String(lastWifiDisconnectRssi); s += ",";
+  s += "\"wifiEventLog\":\""; s += jsonEscape(wifiEventLogText()); s += "\",";
   s += "\"mqttConnected\":"; s += (mqtt.connected() ? "true" : "false"); s += ",";
   int mqttStateNow = mqtt.connected() ? 0 : mqtt.state();
   String mqttErrNow = mqtt.connected() ? String("OK") : lastMqttError;
@@ -2416,6 +2764,7 @@ void handleConfigGet() {
   s += "\"wifiPassSet\":"; s += (cfgWifiPass.length() ? "true" : "false"); s += ",";
   s += "\"apSsid\":\""; s += jsonEscape(cfgApSsid); s += "\",";
   s += "\"apPassSet\":"; s += (cfgApPass.length() ? "true" : "false"); s += ",";
+  s += "\"ntpServer\":\""; s += jsonEscape(cfgNtpServer); s += "\",";
   s += "\"mqttHost\":\""; s += jsonEscape(cfgMqttHost); s += "\",";
   s += "\"mqttPort\":"; s += String(cfgMqttPort); s += ",";
   s += "\"mqttUser\":\""; s += jsonEscape(cfgMqttUser); s += "\",";
@@ -2443,6 +2792,7 @@ void handleConfigSave() {
 
   String newWifiSsid = server.arg("wifi_ssid");
   String newApSsid = server.arg("ap_ssid");
+  String newNtpServer = server.arg("ntp_server");
   String newMqttHost = server.arg("mqtt_host");
   String newMqttClientId = server.arg("mqtt_clientid");
   String newMqttRoot = server.arg("mqtt_root");
@@ -2460,6 +2810,7 @@ void handleConfigSave() {
 
   if (newWifiSsid.length() == 0) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "WLAN SSID fehlt"); return; }
   if (newApSsid.length() == 0) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "AP Name fehlt"); return; }
+  if (!validNtpServerText(newNtpServer)) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "NTP-Server ungueltig: nur Hostname oder IPv4-Adresse ohne http://"); return; }
   if (newMqttHost.length() == 0) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "MQTT Broker fehlt"); return; }
   if (newMqttPort < 1 || newMqttPort > 65535) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "MQTT Port ungueltig"); return; }
   if (newMqttClientId.length() == 0) { sendNoCache(); server.send(400, "text/plain; charset=utf-8", "MQTT Client-ID fehlt"); return; }
@@ -2486,6 +2837,8 @@ void handleConfigSave() {
 
   cfgWifiSsid = newWifiSsid;
   cfgApSsid = newApSsid;
+  bool ntpServerChanged = cfgNtpServer != newNtpServer;
+  cfgNtpServer = newNtpServer;
   cfgMqttHost = newMqttHost;
   cfgMqttPort = (uint16_t)newMqttPort;
   cfgMqttUser = server.arg("mqtt_user");
@@ -2513,6 +2866,7 @@ void handleConfigSave() {
   prefs.putString("wifi_pass", cfgWifiPass);
   prefs.putString("ap_ssid", cfgApSsid);
   prefs.putString("ap_pass", cfgApPass);
+  prefs.putString("ntp_server", cfgNtpServer);
   prefs.putString("mqtt_host", cfgMqttHost);
   prefs.putUShort("mqtt_port", cfgMqttPort);
   prefs.putString("mqtt_user", cfgMqttUser);
@@ -2538,9 +2892,10 @@ void handleConfigSave() {
   mqtt.setServer(cfgMqttHost.c_str(), cfgMqttPort);
   lastMqttTryMs = 0;
   lastMqttError = "Konfiguration gespeichert, MQTT reconnect folgt";
+  if (ntpServerChanged && WiFi.status() == WL_CONNECTED) startNtpSync("NTP-Server geaendert");
 
   sendNoCache();
-  server.send(200, "text/plain; charset=utf-8", "Gespeichert. MQTT wird neu verbunden. WLAN/AP nach Neustart aktiv. Modbus gilt sofort.");
+  server.send(200, "text/plain; charset=utf-8", "Gespeichert. MQTT wird neu verbunden. NTP wird bei Bedarf sofort aktualisiert. WLAN/AP nach Neustart aktiv. Modbus gilt sofort.");
 }
 
 void handlePasswordSet() {
@@ -2609,14 +2964,46 @@ void handleRestart() {
 }
 
 // =====================================================
-// WLAN Setup
+// WLAN Setup / Reconnect
 // =====================================================
+// Startet den Fallback-AP. Bei einem Verbindungsverlust wird AP+STA verwendet:
+// Das Geraet bleibt dann ueber den AP erreichbar und versucht parallel weiter,
+// sich wieder mit dem normalen WLAN zu verbinden.
+void startFallbackAp(const String& reason) {
+  WiFi.mode(WIFI_AP_STA);
+  bool apOk;
+  if (cfgApPass.length() >= 8) apOk = WiFi.softAP(cfgApSsid.c_str(), cfgApPass.c_str());
+  else apOk = WiFi.softAP(cfgApSsid.c_str());
+
+  wifiFallbackApActive = apOk;
+  wifiModeText = apOk ? "AP" : "AP Fehler";
+  if (apOk) {
+    lastWifiAction = reason + " Fallback-AP aktiv: " + WiFi.softAPIP().toString();
+  } else {
+    lastWifiAction = reason + " Fallback-AP konnte nicht gestartet werden";
+  }
+  addWifiEventLog(lastWifiAction);
+  Serial.println(lastWifiAction);
+}
+
 // Baut zuerst die normale WLAN-Verbindung auf.
 // Gelingt das nicht innerhalb des Zeitfensters, startet der ESP einen Fallback-AP,
 // damit WLAN-/MQTT-Daten ueber die Konfigurationsseite korrigiert werden koennen.
 void setupWiFi() {
+  WiFi.persistent(false);     // Keine Flash-Schreibvorgaenge durch WiFi-Library.
+  WiFi.setSleep(false);       // Stabiler fuer dauerhaftes Webinterface/MQTT.
+  WiFi.setAutoReconnect(true);
+
+  if (cfgWifiSsid.length() == 0) {
+    lastWifiError = "Keine WLAN-SSID konfiguriert";
+    startFallbackAp("Keine WLAN-SSID konfiguriert.");
+    return;
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
+  lastWifiError = "WLAN-Verbindung wird aufgebaut";
+  lastWifiAction = "Verbinde mit WLAN";
   Serial.print("WLAN verbinden");
 
   uint32_t start = millis();
@@ -2626,18 +3013,79 @@ void setupWiFi() {
   }
   Serial.println();
 
+  lastWifiStatusCode = WiFi.status();
   if (WiFi.status() == WL_CONNECTED) {
     wifiModeText = "STA";
+    wifiFallbackApActive = false;
+    wifiLostSinceMs = 0;
+    lastWifiError = "OK";
+    lastWifiAction = "WLAN verbunden: " + WiFi.localIP().toString();
+    lastWifiRssi = WiFi.RSSI();
+    addWifiEventLog(lastWifiAction + ", RSSI " + String(lastWifiRssi) + " dBm");
+    startNtpSync("WLAN-Startverbindung");
     Serial.print("WLAN OK: ");
     Serial.println(WiFi.localIP());
   } else {
-    WiFi.mode(WIFI_AP);
-    bool apOk;
-    if (cfgApPass.length() >= 8) apOk = WiFi.softAP(cfgApSsid.c_str(), cfgApPass.c_str());
-    else apOk = WiFi.softAP(cfgApSsid.c_str());
-    wifiModeText = apOk ? "AP" : "AP Fehler";
-    Serial.print("Fallback AP: ");
-    Serial.println(WiFi.softAPIP());
+    lastWifiError = "WLAN-Verbindung fehlgeschlagen: " + wifiStatusText(lastWifiStatusCode);
+    startFallbackAp(lastWifiError + ".");
+  }
+}
+
+// Ueberwacht die WLAN-Verbindung im laufenden Betrieb.
+// Wenn nur WLAN ausfaellt, laufen Modbus-Polling und RS485-Antworten weiter.
+// Der ESP startet dann zyklisch Reconnect-Versuche und nach kurzer Zeit einen
+// Fallback-AP als Rettungsweg zur Web-Konfiguration.
+void maintainWiFi() {
+  if (cfgWifiSsid.length() == 0) return;
+
+  int st = WiFi.status();
+  lastWifiStatusCode = st;
+
+  if (st == WL_CONNECTED) {
+    lastWifiRssi = WiFi.RSSI();
+    if (wifiLostSinceMs != 0 || lastWifiError != "OK") {
+      lastWifiAction = "WLAN wieder verbunden: " + WiFi.localIP().toString();
+      addWifiEventLog(lastWifiAction + ", RSSI " + String(lastWifiRssi) + " dBm");
+      startNtpSync("WLAN-Reconnect");
+      Serial.println(lastWifiAction);
+    }
+    lastWifiError = "OK";
+    wifiModeText = "STA";
+    wifiLostSinceMs = 0;
+
+    // Wenn der Fallback-AP nur wegen eines WLAN-Ausfalls aktiv war, wird er nach
+    // erfolgreichem Reconnect wieder abgeschaltet. Danach ist das Gateway wieder
+    // nur im normalen Heimnetz erreichbar.
+    if (wifiFallbackApActive) {
+      WiFi.softAPdisconnect(true);
+      wifiFallbackApActive = false;
+      WiFi.mode(WIFI_STA);
+      WiFi.setAutoReconnect(true);
+    }
+    return;
+  }
+
+  if (wifiLostSinceMs == 0) {
+    wifiLostSinceMs = millis();
+    if (lastWifiDisconnectReasonCode == 0) lastWifiError = "WLAN getrennt: " + wifiStatusText(st);
+    lastWifiAction = "Reconnect gestartet; Modbus-Polling laeuft weiter";
+    addWifiEventLog(lastWifiAction);
+    Serial.println(lastWifiError);
+  }
+
+  if (millis() - lastWifiCheckMs >= 10000UL) {
+    lastWifiCheckMs = millis();
+    wifiReconnectAttempts++;
+    // Den genauen Reason-Code nicht durch den groben WiFi.status()-Text ueberschreiben.
+    if (lastWifiDisconnectReasonCode == 0) lastWifiError = "WLAN getrennt: " + wifiStatusText(st);
+    lastWifiAction = "Reconnect-Versuch " + String(wifiReconnectAttempts);
+    addWifiEventLog(lastWifiAction);
+    Serial.println(lastWifiAction);
+    if (!WiFi.reconnect()) WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
+  }
+
+  if (!wifiFallbackApActive && millis() - wifiLostSinceMs >= 60000UL) {
+    startFallbackAp("WLAN seit mehr als 60 s getrennt.");
   }
 }
 
@@ -2660,6 +3108,8 @@ void setup() {
 
   loadConfig();
   applyModbusSerial();
+  WiFi.onEvent(onWiFiEvent);
+  addWifiEventLog(String("Gateway gestartet, Firmware ") + FW_VERSION);
   setupWiFi();
 
   mqtt.setServer(cfgMqttHost.c_str(), cfgMqttPort);
@@ -2682,7 +3132,7 @@ void setup() {
   server.begin();
 
   lastStatus = "Bereit";
-  Serial.println("Unico-Gateway V1.3.2 bereit - SETTINGS_PANEL_ACTIVE / Bedienen plus Einstellungen");
+  Serial.println("Unico-Gateway V1.4.5 bereit - NTP_WIFI_REASON_DIAGNOSTICS_ACTIVE");
 }
 
 // Hauptschleife: Webserver bedienen, MQTT-Verbindung pflegen und Modbus zyklisch pollen.
@@ -2690,6 +3140,11 @@ void setup() {
 // mit Lese- und Schreibtelegrammen gleichzeitig belastet wird.
 void loop() {
   server.handleClient();
+
+  processPendingWifiEvents();
+  maintainWiFi();
+  maintainNtp();
+  if (WiFi.status() != WL_CONNECTED && mqtt.connected()) mqtt.disconnect();
 
   mqttConnectIfNeeded();
   if (mqtt.connected()) mqtt.loop();
